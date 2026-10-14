@@ -1,119 +1,51 @@
-# palpites-back
+# Pitaco API
 
-Backend Rust com **arquitetura hexagonal (Ports & Adapters)**: domínio puro,
-casos de uso desacoplados de I/O via traits, e adaptadores concretos
-(axum + sqlx/mysql + jwt + argon2) injetados nas bordas.
+Pitaco is a football prediction pool app: players join pools, predict match scores and climb a ranking as results come in. This repository holds the HTTP API, written in Rust with axum and MySQL.
 
-> Este projeto foi gerado a partir do template `rust-backend-template`.
+| Part | What it is |
+| --- | --- |
+| `pitaco-api` (this repo) | REST API under `/api/v1`: accounts, pools, predictions, scoring, rankings, notifications and the admin side of tournaments, teams and matches. |
+| [`pitaco-web`](https://github.com/Viniciusadm/pitaco-web) | The web app (React + TanStack Router, installable as a PWA) that talks to this API. |
 
-## Gerar um novo projeto a partir deste template
+The code started from [rust-backend-template](https://github.com/Viniciusadm/rust-backend-template) and keeps its layout: `domain` holds pure types and rules, `application` holds use cases generic over traits (ports), `infrastructure` implements those ports (MySQL repositories, Argon2, JWT, file storage, FCM) and `api` is the axum layer.
+
+## What it does
+
+- **Accounts**: register, log in with a JWT, profile, avatar upload and notification preferences.
+- **Pools**: create a pool with its own scoring rules, join it with an invite code (optionally limited to an email allowlist), list members, leave, and read the ranking and the history of results.
+- **Predictions**: one score per match, locked a pool-defined number of minutes before kickoff. Scoring rules give points for the exact score, the right outcome, the right goal difference and, in knockout games, the penalty shoot-out winner (`src/domain/predictions/scoring_policy.rs`).
+- **Admin**: tournaments with stages and groups, teams with flags, matches and results. Only users with the admin role can change them, and every change is written to an audit log.
+- **Background jobs**: an in-process tokio scheduler moves matches to live, sends reminders before predictions lock and delivers queued notifications as push messages through Firebase Cloud Messaging.
+
+## Requirements
+
+- Rust stable (edition 2021)
+- MySQL 8
+
+Main stack: axum 0.7, sqlx 0.8 (MySQL, rustls), jsonwebtoken 9, argon2 0.5, tower-http 0.6, reqwest 0.12.
+
+## Running locally
+
+Copy the environment file and set `DATABASE_URL` and `JWT_SECRET`:
 
 ```bash
-# instalar a ferramenta uma vez
-cargo install cargo-generate
-
-# a partir de um caminho local
-cargo generate --path /caminho/para/rust-backend-template --name meu-servico
-
-# ou de um repositório Git
-cargo generate --git <url-do-repo> --name meu-servico
+cp .env.example .env
 ```
 
-`--name meu-servico` define `project-name` (kebab-case) e `crate_name`
-(snake_case, ex.: `meu_servico`) automaticamente.
-
-## Rodar
+Start the API. Migrations in `migrations/` run on boot unless `RUN_MIGRATIONS=false`:
 
 ```bash
-cp .env.example .env          # ajuste DATABASE_URL e JWT_SECRET
-cargo test                    # testes de caso de uso (não precisam de banco)
-cargo run                     # sobe a API (precisa de MySQL para persistência)
+cargo run
 ```
 
-Endpoints do slice de exemplo:
+The server listens on `HTTP_HOST:HTTP_PORT` (`127.0.0.1:3001` by default) and answers `GET /health`. Uploaded files are stored under `FILES_LOCAL_DIR`.
 
-- `GET  /health`
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/login`
-- `GET  /api/v1/auth/me` (requer `Authorization: Bearer <token>`)
+Push notifications stay off until `FCM_PROJECT_ID` and `FCM_SERVICE_ACCOUNT_PATH` point to a Firebase project and its service account JSON. Keep that file out of git. Every variable is described in [`.env.example`](.env.example).
 
-## Arquitetura
+## Tests
 
-As dependências apontam **para dentro**: `api → application → domain`. A
-infraestrutura implementa os traits (ports) definidos em `application`, e é
-injetada nos handlers por request.
-
-```
-src/
-├── domain/            Regras e tipos puros (sem axum/sqlx/serde)
-│   ├── value_objects.rs   DomainId, Email, NonEmptyString, UtcDateTime
-│   └── users/entities.rs  struct User
-├── application/       Casos de uso + ports (traits)
-│   └── auth/
-│       ├── ports.rs       UserRepository, PasswordHasher, TokenIssuer, TokenVerifier
-│       ├── commands.rs    DTOs de entrada/saída
-│       └── use_cases.rs   AuthUseCases<R,H,T> (genérico sobre os ports)
-├── infrastructure/    Adaptadores concretos (implementam os ports)
-│   ├── auth/              Argon2PasswordHasher, JwtTokenService
-│   └── repositories/      MySqlUserRepository + mapper (linha → domínio)
-├── database/          pool + transaction
-├── config/            AppConfig::from_env()
-├── errors/            AppError (enum único) + códigos estáveis
-└── api/               Camada HTTP (axum)
-    ├── state.rs           AppState (só infra: pool + jwt_secret)
-    ├── dto/               Request/Response + From para commands
-    ├── extractors/        AuthenticatedUser (FromRequestParts)
-    └── routes/            health + v1 (handlers + app_error)
+```bash
+cargo test
 ```
 
-Princípios que o template segue (e que você deve manter):
-
-- **Sem estado global / service locator.** O `AppState` guarda só
-  infraestrutura. Cada handler constrói seu caso de uso por request.
-- **Domínio não conhece framework.** Nada de `serde`/`sqlx`/`axum` em `domain/`.
-- **Erros num único `AppError`**, traduzido para HTTP em `app_error()`.
-- **Casos de uso genéricos sobre os ports** → testáveis com fakes, sem banco.
-
-## Como adicionar uma feature nova (ex.: `products`)
-
-Replique o mesmo padrão, camada por camada:
-
-1. **Application** - `src/application/products/`
-   - `ports.rs`: trait `ProductRepository` (+ records de persistência)
-   - `commands.rs`: DTOs de entrada/saída
-   - `use_cases.rs`: `ProductUseCases<R>` genérico sobre o(s) port(s)
-   - `mod.rs`: `pub use commands/ports/use_cases::*;`
-   - registre `pub mod products;` em `src/application/mod.rs`
-2. **Domain** - `src/domain/products/{mod.rs,entities.rs}`; value objects novos
-   vão em `src/domain/value_objects.rs`. Sem dependências de framework.
-3. **Infrastructure** - `src/infrastructure/repositories/mysql_products.rs`
-   implementa o trait; conversões de linha → domínio em `mapper.rs`. Registre
-   em `repositories/mod.rs`.
-4. **API** - `src/api/routes/v1/products.rs` com `router()` + handlers;
-   instancie o caso de uso por request e trate erros com `app_error()`. Faça
-   `.merge(products::router())` em `src/api/routes/v1/mod.rs`.
-5. **DTOs** - `src/api/dto/products.rs` com `From<Request> for Command`.
-6. **Tests** - `tests/products_use_cases.rs` com fakes dos ports (veja
-   `tests/auth_use_cases.rs` como modelo).
-
-## Variáveis de ambiente
-
-Veja `.env.example`. Resumo:
-
-| Variável         | Default                | Descrição                              |
-|------------------|------------------------|----------------------------------------|
-| `HTTP_HOST`      | `127.0.0.1`            | Host de bind                           |
-| `HTTP_PORT`      | `3001`                 | Porta                                  |
-| `DATABASE_URL`   | -                      | Conexão MySQL (sem ela, sem persistência) |
-| `JWT_SECRET`     | `development-only-secret` | Segredo de assinatura do JWT        |
-| `RUN_MIGRATIONS` | `true`                 | Rodar migrations no boot               |
-| `FILES_BACKEND`  | `local`                | Backend de arquivos: `local` ou `s3` (stub) |
-| `FILES_BUCKET`   | `palpites-local`       | Bucket/diretório lógico dos arquivos   |
-| `FILES_LOCAL_DIR`| `./storage`            | Raiz do adapter local                  |
-| `FILES_PUBLIC_BASE_URL` | `http://127.0.0.1:3001/files-local` | Base das URLs assinadas (local) |
-| `FILES_MAX_BYTE_SIZE` | `5242880`         | Tamanho máximo de upload em bytes (5 MiB) |
-| `S3_REGION` / `S3_ENDPOINT` | -          | Config do backend s3 (stub neste build) |
-| `JOBS_ENABLED`   | `true`                 | Liga o scheduler de jobs em background (tokio) |
-| `JOBS_REMINDER_INTERVAL_SECONDS` | `300`  | Intervalo do job de lembretes de palpite |
-| `JOBS_REMINDER_WINDOW_MINUTES` | `60`     | Janela para "lock se aproximando" dos lembretes |
-| `JOBS_DISPATCH_INTERVAL_SECONDS` | `60`   | Intervalo do job de entrega de notificações |
+The tests in [`tests`](tests) run the use cases, the scoring policy, the background jobs and the HTTP routes for files, pools and predictions against in-memory fakes of the ports, so they do not need a database.
